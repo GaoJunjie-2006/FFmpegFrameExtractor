@@ -7,12 +7,11 @@ from tkinter import (
     messagebox, filedialog, OptionMenu
 )
 
-# ffmpeg 路径
+# ffmpeg 路径，报错自己改
 FFMPEG_PATH = os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe")
 FFPROBE_PATH = os.path.join(os.getcwd(), "ffmpeg", "bin", "ffprobe.exe")
-# 并行线程数
+################################################################################
 MAX_THREADS = multiprocessing.cpu_count()
-
 def detect_nvidia_gpus():
     try:
         result = subprocess.run(
@@ -24,7 +23,6 @@ def detect_nvidia_gpus():
     except Exception:
         pass
     return []
-
 def detect_intel_qsv():
     try:
         result = subprocess.run(
@@ -81,7 +79,7 @@ def get_video_frame_count(path):
             return int(res2.stdout.strip())
     except:
         pass
-    # 回退估算
+
     return int(get_video_duration(path) * get_video_fps(path))
 
 def merge_videos(paths, tmpdir):
@@ -103,7 +101,7 @@ def merge_videos(paths, tmpdir):
 def build_ffmpeg_cmd(path, out_folder, indices, hw, gpu):
     out_pattern = os.path.join(out_folder, '%07d.png')
     cmd = [FFMPEG_PATH, '-hide_banner', '-loglevel', 'error']
-    # 硬件解码选项
+
     if hw == 'NVIDIA CUDA' and gpu:
         idx = int(gpu.split()[1].strip(':'))
         cmd += ['-hwaccel', 'cuda', '-hwaccel_device', str(idx), '-c:v', 'h264_cuvid']
@@ -113,7 +111,7 @@ def build_ffmpeg_cmd(path, out_folder, indices, hw, gpu):
             '-threads', str(MAX_THREADS), '-i', path,
             '-map', '0:v', '-an', '-sn']
 
-    # 仅在 CPU 上执行 select 过滤，避免 GPU↔CPU 格式不兼容错误
+
     expr = '+'.join(f"eq(n\\,{i})" for i in indices)
     vf_chain = f"select='{expr}'"
 
@@ -136,7 +134,8 @@ def extract_by_total(paths, out, total, hw, gpu, workers):
         merged = merge_videos(paths, td)
         extract_from_merged(merged, out, total, hw, gpu)
 
-# GUI
+###########################################################################
+#下面是ui
 
 def main():
     root = Tk()
