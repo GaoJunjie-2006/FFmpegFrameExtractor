@@ -7,11 +7,12 @@ from tkinter import (
     messagebox, filedialog, OptionMenu
 )
 
-# ffmpeg 路径，报错自己改
+# FFmpeg 可执行文件路径（根据你本地目录调整）
 FFMPEG_PATH = os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe")
 FFPROBE_PATH = os.path.join(os.getcwd(), "ffmpeg", "bin", "ffprobe.exe")
-################################################################################
+
 MAX_THREADS = multiprocessing.cpu_count()
+
 def detect_nvidia_gpus():
     try:
         result = subprocess.run(
@@ -20,9 +21,10 @@ def detect_nvidia_gpus():
         if result.returncode == 0:
             return [f"GPU {idx}: {name}" for idx, name in
                     (line.split(',') for line in result.stdout.strip().splitlines())]
-    except Exception:
+    except:
         pass
     return []
+
 def detect_intel_qsv():
     try:
         result = subprocess.run(
@@ -30,7 +32,7 @@ def detect_intel_qsv():
              'Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name'],
             capture_output=True, text=True, timeout=3)
         return any("Intel" in line for line in result.stdout.splitlines())
-    except Exception:
+    except:
         return False
 
 def detect_amd_vaapi():
@@ -79,8 +81,18 @@ def get_video_frame_count(path):
             return int(res2.stdout.strip())
     except:
         pass
-
     return int(get_video_duration(path) * get_video_fps(path))
+
+def get_rotation(path):
+    try:
+        out = subprocess.run(
+            [FFPROBE_PATH, '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream_tags=rotate',
+             '-of', 'default=noprint_wrappers=1:nokey=1', path],
+            capture_output=True, text=True)
+        return int(out.stdout.strip() or 0)
+    except:
+        return 0
 
 def merge_videos(paths, tmpdir):
     listf = os.path.join(tmpdir, 'list.txt')
@@ -89,12 +101,15 @@ def merge_videos(paths, tmpdir):
             safe = p.replace("'", "'\\''")
             f.write(f"file '{safe}'\n")
     merged = os.path.join(tmpdir, 'merged.mp4')
-    cmd = [FFMPEG_PATH, '-noautorotate',
-           '-hide_banner', '-loglevel', 'error',
-           '-probesize', '5M', '-analyzeduration', '100M',
-           '-f', 'concat', '-safe', '0', '-i', listf,
-           '-map', '0:v:0', '-c', 'copy', '-threads', str(MAX_THREADS),
-           merged, '-y']
+    cmd = [
+        FFMPEG_PATH,
+        '-hide_banner', '-loglevel', 'error',
+        '-probesize', '5M', '-analyzeduration', '100M',
+        '-f', 'concat', '-safe', '0', '-i', listf,
+        '-map', '0:v:0', '-c', 'copy',
+        '-threads', str(MAX_THREADS),
+        merged, '-y'
+    ]
     subprocess.run(cmd, check=True)
     return merged
 
@@ -102,18 +117,35 @@ def build_ffmpeg_cmd(path, out_folder, indices, hw, gpu):
     out_pattern = os.path.join(out_folder, '%07d.png')
     cmd = [FFMPEG_PATH, '-hide_banner', '-loglevel', 'error']
 
+    # 硬件加速选项：NVIDIA 或 Intel QSV
     if hw == 'NVIDIA CUDA' and gpu:
         idx = int(gpu.split()[1].strip(':'))
-        cmd += ['-hwaccel', 'cuda', '-hwaccel_device', str(idx), '-c:v', 'h264_cuvid']
+        cmd += ['-hwaccel', 'cuda', '-hwaccel_device', str(idx), '-c:v', 'h264']
     elif hw == 'Intel QSV':
         cmd += ['-hwaccel', 'qsv', '-c:v', 'h264_qsv']
-    cmd += ['-probesize', '5M', '-analyzeduration', '100M',
-            '-threads', str(MAX_THREADS), '-i', path,
-            '-map', '0:v', '-an', '-sn']
 
+    cmd += [
+        '-probesize', '5M', '-analyzeduration', '100M',
+        '-threads', str(MAX_THREADS),
+        '-i', path,
+        '-map', '0:v', '-an', '-sn'
+    ]
 
+    # 选帧表达式
     expr = '+'.join(f"eq(n\\,{i})" for i in indices)
     vf_chain = f"select='{expr}'"
+
+    # 修正旋转：撤销 metadata 导致的横屏压缩
+    # 如果旋转元数据 rotate=90，则逆时针 90°（transpose=2）
+    # rotate=270 则顺时针 90°（transpose=1）
+    rotation = get_rotation(path)
+    transpose_map = {
+        90: 'transpose=2',
+        180: 'transpose=2,transpose=2',
+        270: 'transpose=1',
+    }
+    if rotation in transpose_map:
+        vf_chain += f",{transpose_map[rotation]}"
 
     cmd += ['-vf', vf_chain, '-vsync', 'vfr', out_pattern, '-y']
     return cmd
@@ -121,11 +153,14 @@ def build_ffmpeg_cmd(path, out_folder, indices, hw, gpu):
 def extract_from_merged(merged, out, total, hw, gpu):
     frames = get_video_frame_count(merged)
     if frames <= 0:
-        raise RuntimeError('无法获取帧数')
+        raise RuntimeError('无法获取视频帧数')
     step = frames / (total + 1)
     idxs = [int((i + 1) * step) for i in range(total)]
     cmd = build_ffmpeg_cmd(merged, out, idxs, hw, gpu)
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"FFmpeg 执行失败：\n命令：{' '.join(cmd)}\n错误：{e}")
 
 def extract_by_total(paths, out, total, hw, gpu, workers):
     if total <= 0 or not paths:
@@ -134,8 +169,7 @@ def extract_by_total(paths, out, total, hw, gpu, workers):
         merged = merge_videos(paths, td)
         extract_from_merged(merged, out, total, hw, gpu)
 
-###########################################################################
-#下面是ui
+# —————— 以下为 UI 部分，请保持不变 ——————
 
 def main():
     root = Tk()
