@@ -69,9 +69,11 @@ def calculate_max_frames(video_paths):
             total_frames += get_video_frame_count(path)
     return total_frames
 
-def build_ffmpeg_command(video_path, output_folder, fps, hwaccel_type, gpu_name=None):
-    output_pattern = os.path.join(output_folder, "%04d.png")
+# 新增：构建带帧号选择的 FFmpeg 命令
+def build_ffmpeg_command_with_indices(video_path, output_folder, frame_indices, hwaccel_type, gpu_name=None):
+    output_pattern = os.path.join(output_folder, "%07d.png")  # 防止重名改成了 %05d
     cmd = [FFMPEG_PATH, "-hide_banner", "-loglevel", "error"]
+
     if hwaccel_type == "NVIDIA CUDA" and gpu_name:
         gpu_index = int(gpu_name.split()[1].replace(':', ''))
         cmd += ["-hwaccel", "cuda", "-hwaccel_device", str(gpu_index), "-c:v", "h264_cuvid"]
@@ -80,27 +82,54 @@ def build_ffmpeg_command(video_path, output_folder, fps, hwaccel_type, gpu_name=
     elif hwaccel_type == "AMD VAAPI":
         messagebox.showwarning("提示", "VAAPI 仅支持 Linux，建议放在虚拟机运行！\n当前将回退为 CPU 模式。")
         hwaccel_type = "CPU"
-    cmd += ["-i", video_path, "-vf", f"fps={fps}", output_pattern, "-y"]
+
+    cmd += ["-i", video_path]
+
+    select_expr = '+'.join(f'eq(n\\,{i})' for i in frame_indices)
+    cmd += ["-vf", f"select='{select_expr}'", "-vsync", "vfr", output_pattern, "-y"]
     return cmd
 
-def extract_frames(video_path, output_folder, fps, hwaccel, gpu_name):
-    cmd = build_ffmpeg_command(video_path, output_folder, fps, hwaccel, gpu_name)
+# 新增：按帧索引提取帧
+def extract_frames_with_indices(video_path, output_folder, frame_indices, hwaccel, gpu_name):
+    cmd = build_ffmpeg_command_with_indices(video_path, output_folder, frame_indices, hwaccel, gpu_name)
     subprocess.run(cmd)
 
+# 替换原函数：按指定总数提取帧（更精确）
 def extract_frames_by_total_count(video_paths, output_folder, total_num_images, hwaccel, gpu_name, max_workers):
-    total_duration = sum(get_video_duration(p) for p in video_paths if os.path.exists(p))
-    if total_duration == 0:
-        total_duration = 1  # 防止除零
-    images_per_second = total_num_images / total_duration
+    all_videos = []
+    total_frames = 0
 
-    def process_single(video_path):
-        duration = get_video_duration(video_path)
-        num_images = max(1, int(images_per_second * duration))
-        fps = num_images / duration
-        extract_frames(video_path, output_folder, fps, hwaccel, gpu_name)
+    # 收集所有视频的信息
+    for path in video_paths:
+        if not os.path.exists(path):
+            continue
+        frame_count = get_video_frame_count(path)
+        total_frames += frame_count
+        all_videos.append((path, frame_count))
 
+    if total_frames == 0 or total_num_images <= 0:
+        return
+
+    # 计算每个视频应提取哪些帧
+    per_video_indices = []
+
+    remaining = total_num_images
+    for path, frame_count in all_videos:
+        ratio = frame_count / total_frames
+        images_to_extract = max(1, round(ratio * total_num_images))
+        if images_to_extract > remaining:
+            images_to_extract = remaining
+        remaining -= images_to_extract
+
+        step = max(1, frame_count // images_to_extract)
+        indices = list(range(0, frame_count, step))[:images_to_extract]
+        per_video_indices.append((path, indices))
+
+    # 多线程执行
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(process_single, p) for p in video_paths]
+        futures = []
+        for path, indices in per_video_indices:
+            futures.append(pool.submit(extract_frames_with_indices, path, output_folder, indices, hwaccel, gpu_name))
         for f in futures:
             f.result()
 
@@ -215,6 +244,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
