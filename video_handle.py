@@ -1,270 +1,277 @@
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
 import os
-import subprocess
-import multiprocessing
-import tempfile
-from tkinter import (
-    Tk, Label, Button, Frame, StringVar, Spinbox, IntVar, Entry,
-    messagebox, filedialog, OptionMenu
-)
+import cv2
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import ffmpeg
 
-# FFmpeg 可执行文件路径（根据你本地目录调整）
-FFMPEG_PATH = os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe")
-FFPROBE_PATH = os.path.join(os.getcwd(), "ffmpeg", "bin", "ffprobe.exe")
 
-MAX_THREADS = multiprocessing.cpu_count()
+def create_video_importer_gui():
+    root = tk.Tk()
+    root.title("极致视频处理工具 - v2.1")
+    root.geometry("800x600")
+    root.minsize(700, 500)
 
-def detect_nvidia_gpus():
-    try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=index,name', '--format=csv,noheader'],
-            capture_output=True, text=True, timeout=3)
-        if result.returncode == 0:
-            return [f"GPU {idx}: {name}" for idx, name in
-                    (line.split(',') for line in result.stdout.strip().splitlines())]
-    except:
-        pass
-    return []
+    # 设置主题样式（跨平台兼容）
+    style = ttk.Style()
+    style.configure('TButton', padding=6, relief='flat', background="#4CAF50")
+    style.configure('TLabel', font=('Segoe UI', 10))
+    style.configure('Header.TLabel', font=('Segoe UI', 12, 'bold'))
 
-def detect_intel_qsv():
-    try:
-        result = subprocess.run(
-            ['powershell', '-Command',
-             'Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name'],
-            capture_output=True, text=True, timeout=3)
-        return any("Intel" in line for line in result.stdout.splitlines())
-    except:
-        return False
+    # 数据存储
+    video_files = []
+    output_path = [None]
+    temp_dir = "temp"
+    total_frames = [0]
+    merged_video_path = os.path.join(temp_dir, "merged_output.mp4")
+    split_mode = False
 
-def detect_amd_vaapi():
-    return False
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
 
-def get_video_duration(path):
-    try:
-        out = subprocess.run(
-            [FFPROBE_PATH, '-v', 'error', '-select_streams', 'v:0',
-             '-show_entries', 'format=duration',
-             '-of', 'default=noprint_wrappers=1:nokey=1', path],
-            capture_output=True, text=True)
-        return float(out.stdout.strip())
-    except:
-        return 0.0
+    filetypes = (
+        ("视频文件", "*.mp4 *.mov *.avi *.mkv *.flv *.wmv *.webm"),
+        ("所有文件", "*.*")
+    )
 
-def get_video_fps(path):
-    try:
-        out = subprocess.run(
-            [FFPROBE_PATH, '-v', 'error', '-select_streams', 'v:0',
-             '-show_entries', 'stream=r_frame_rate',
-             '-of', 'default=noprint_wrappers=1:nokey=1', path],
-            capture_output=True, text=True)
-        num, den = out.stdout.strip().split('/')
-        return float(num) / float(den)
-    except:
-        return 30.0
+    def select_videos():
+        files = filedialog.askopenfilenames(title="选择视频文件", filetypes=filetypes)
+        if files:
+            video_files.clear()
+            video_files.extend(files)
+            update_listbox()
 
-def get_video_frame_count(path):
-    try:
-        res = subprocess.run(
-            [FFPROBE_PATH, '-v', 'error', '-count_frames',
-             '-select_streams', 'v:0',
-             '-show_entries', 'stream=nb_read_frames',
-             '-of', 'default=noprint_wrappers=1:nokey=1', path],
-            capture_output=True, text=True)
-        if res.stdout.strip().isdigit():
-            return int(res.stdout.strip())
-        res2 = subprocess.run(
-            [FFPROBE_PATH, '-v', 'error',
-             '-select_streams', 'v:0',
-             '-show_entries', 'stream=nb_frames',
-             '-of', 'default=noprint_wrappers=1:nokey=1', path],
-            capture_output=True, text=True)
-        if res2.stdout.strip().isdigit():
-            return int(res2.stdout.strip())
-    except:
-        pass
-    return int(get_video_duration(path) * get_video_fps(path))
+    def update_listbox():
+        listbox.delete(0, tk.END)
+        for f in video_files:
+            listbox.insert(tk.END, os.path.basename(f))
 
-def get_rotation(path):
-    try:
-        out = subprocess.run(
-            [FFPROBE_PATH, '-v', 'error', '-select_streams', 'v:0',
-             '-show_entries', 'stream_tags=rotate',
-             '-of', 'default=noprint_wrappers=1:nokey=1', path],
-            capture_output=True, text=True)
-        return int(out.stdout.strip() or 0)
-    except:
-        return 0
+    def select_output_folder():
+        folder = filedialog.askdirectory(title="选择输出文件夹")
+        if folder:
+            output_path[0] = folder
+            output_label.config(text=f"输出路径：{folder}")
 
-def merge_videos(paths, tmpdir):
-    listf = os.path.join(tmpdir, 'list.txt')
-    with open(listf, 'w', encoding='utf-8') as f:
-        for p in paths:
-            safe = p.replace("'", "'\\''")
-            f.write(f"file '{safe}'\n")
-    merged = os.path.join(tmpdir, 'merged.mp4')
-    cmd = [
-        FFMPEG_PATH,
-        '-hide_banner', '-loglevel', 'error',
-        '-probesize', '5M', '-analyzeduration', '100M',
-        '-f', 'concat', '-safe', '0', '-i', listf,
-        '-map', '0:v:0', '-c', 'copy',
-        '-threads', str(MAX_THREADS),
-        merged, '-y'
-    ]
-    subprocess.run(cmd, check=True)
-    return merged
+    def analyze_and_concatenate():
+        nonlocal split_mode
+        split_mode = False
 
-def build_ffmpeg_cmd(path, out_folder, indices, hw, gpu):
-    out_pattern = os.path.join(out_folder, '%07d.png')
-    cmd = [FFMPEG_PATH, '-hide_banner', '-loglevel', 'error']
-
-    # 硬件加速选项：NVIDIA 或 Intel QSV
-    if hw == 'NVIDIA CUDA' and gpu:
-        idx = int(gpu.split()[1].strip(':'))
-        cmd += ['-hwaccel', 'cuda', '-hwaccel_device', str(idx), '-c:v', 'h264']
-    elif hw == 'Intel QSV':
-        cmd += ['-hwaccel', 'qsv', '-c:v', 'h264_qsv']
-
-    cmd += [
-        '-probesize', '5M', '-analyzeduration', '100M',
-        '-threads', str(MAX_THREADS),
-        '-i', path,
-        '-map', '0:v', '-an', '-sn'
-    ]
-
-    # 选帧表达式
-    expr = '+'.join(f"eq(n\\,{i})" for i in indices)
-    vf_chain = f"select='{expr}'"
-
-    # 修正旋转：撤销 metadata 导致的横屏压缩
-    # 如果旋转元数据 rotate=90，则逆时针 90°（transpose=2）
-    # rotate=270 则顺时针 90°（transpose=1）
-    rotation = get_rotation(path)
-    transpose_map = {
-        90: 'transpose=2',
-        180: 'transpose=2,transpose=2',
-        270: 'transpose=1',
-    }
-    if rotation in transpose_map:
-        vf_chain += f",{transpose_map[rotation]}"
-
-    cmd += ['-vf', vf_chain, '-vsync', 'vfr', out_pattern, '-y']
-    return cmd
-
-def extract_from_merged(merged, out, total, hw, gpu):
-    frames = get_video_frame_count(merged)
-    if frames <= 0:
-        raise RuntimeError('无法获取视频帧数')
-    step = frames / (total + 1)
-    idxs = [int((i + 1) * step) for i in range(total)]
-    cmd = build_ffmpeg_cmd(merged, out, idxs, hw, gpu)
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"FFmpeg 执行失败：\n命令：{' '.join(cmd)}\n错误：{e}")
-
-def extract_by_total(paths, out, total, hw, gpu, workers):
-    if total <= 0 or not paths:
-        return
-    with tempfile.TemporaryDirectory() as td:
-        merged = merge_videos(paths, td)
-        extract_from_merged(merged, out, total, hw, gpu)
-
-# —————— 以下为 UI 部分，请保持不变 ——————
-
-def main():
-    root = Tk()
-    root.title("视频帧提取工具（支持硬件加速）")
-    root.geometry("600x600")
-    frame = Frame(root)
-    frame.pack(pady=10)
-
-    selected_files = StringVar()
-    out_dir = StringVar()
-    total_images = IntVar(value=100)
-    core_num = IntVar(value=MAX_THREADS)
-    hw_var = StringVar(value='CPU')
-    gpu_var = StringVar()
-    max_label = StringVar(value='最大可提取帧数: 0')
-
-    gpus = detect_nvidia_gpus()
-    if gpus:
-        gpu_var.set(gpus[0])
-
-    def update_max():
-        files = selected_files.get().split(';') if selected_files.get() else []
-        count = sum(get_video_frame_count(p) for p in files if os.path.exists(p))
-        max_label.set(f"最大可提取帧数: {count}")
-
-    def on_start():
-        files = selected_files.get().split(';') if selected_files.get() else []
-        out = out_dir.get()
-        num = total_images.get()
-        hw = hw_var.get()
-        gpu = gpu_var.get() if hw == 'NVIDIA CUDA' else None
-        if not files or not out:
-            messagebox.showerror('错误', '请选择视频和输出目录')
+        if len(video_files) < 2:
+            messagebox.showwarning("提示", "请至少选择两个视频进行拼接。")
             return
-        if num <= 0:
-            messagebox.showerror('错误', '请输入大于0的图片总数')
+
+        cap1 = cv2.VideoCapture(video_files[0])
+        w1 = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h1 = int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps1 = cap1.get(cv2.CAP_PROP_FPS)
+        ext1 = os.path.splitext(video_files[0])[1].lower()
+        cap1.release()
+
+        for path in video_files[1:]:
+            cap = cv2.VideoCapture(path)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            ext = os.path.splitext(path)[1].lower()
+            cap.release()
+
+            if w != w1 or h != h1:
+                messagebox.showerror("错误", "分辨率不同，请选择相同分辨率的视频。")
+                return
+
+            if abs(fps - fps1) > 0.01:
+                messagebox.showerror("错误", "帧率不同，请选择相同帧率的视频。")
+                return
+
+            if ext != ext1:
+                messagebox.showerror("错误", "格式不同，请选择相同格式的视频。")
+                return
+
+        if not output_path[0]:
+            messagebox.showwarning("提示", "请先选择输出文件夹。")
             return
-        status.config(text='处理中...', fg='blue')
-        root.update()
+
+        inputs = [ffmpeg.input(file) for file in video_files]
+        joined = ffmpeg.concat(*inputs, v=1, a=1).node
+        output = ffmpeg.output(joined[0], joined[1], merged_video_path)
+
         try:
-            extract_by_total(files, out, num, hw, gpu, core_num.get())
-            status.config(text='完成', fg='green')
+            ffmpeg.run(output, overwrite_output=True)  # 添加 overwrite_output=True 参数
+            messagebox.showinfo("成功", f"视频已保存到：\n{merged_video_path}")
+            
+            cap = cv2.VideoCapture(merged_video_path)
+            total_frames[0] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            
+            frame_count_label.config(text=f"最大可裁切数量：{total_frames[0]}")
+            split_mode = True
+            
         except Exception as e:
-            status.config(text=f'失败: {e}', fg='red')
-        finally:
-            root.update()
+            messagebox.showerror("错误", f"视频拼接失败：{str(e)}")
 
-    def select_files():
-        paths = filedialog.askopenfilenames(filetypes=[('视频文件','*.mp4;*.mov;*.avi')])
-        if paths:
-            selected_files.set(';'.join(paths))
-            update_max()
+    def get_frame_transform_func(format_type):
+        def transform(frame):
+            if format_type == "gray":
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            elif format_type == "hsv":
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            elif format_type == "gray_hsv":
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            elif format_type == "gray_png":
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            else:  # png
+                return frame
+        return transform
 
-    def select_out():
-        d = filedialog.askdirectory()
-        if d:
-            out_dir.set(d)
+    def process_frame_range(args):
+        start, end, filename, format_type, folder, indices = args
+        cap = cv2.VideoCapture(filename)
+        transform = get_frame_transform_func(format_type)
+        results = []
 
-    row = 0
-    Label(frame, text='选择视频文件:', width=20, anchor='e').grid(row=row, column=0, pady=4)
-    Button(frame, text='浏览', width=15, command=select_files).grid(row=row, column=1)
-    row += 1
-    Label(frame, textvariable=selected_files, wraplength=450).grid(row=row, column=0, columnspan=2)
-    row += 1
-    Label(frame, text='输出目录:', width=20, anchor='e').grid(row=row, column=0, pady=4)
-    Button(frame, text='选择', width=15, command=select_out).grid(row=row, column=1)
-    row += 1
-    Label(frame, textvariable=out_dir).grid(row=row, column=0, columnspan=2)
-    row += 1
-    Label(frame, text='总共想提取的图片数:', width=20, anchor='e').grid(row=row, column=0, pady=4)
-    Entry(frame, textvariable=total_images, width=20).grid(row=row, column=1)
-    row += 1
-    Label(frame, text='使用的 CPU 核心数:', width=20, anchor='e').grid(row=row, column=0, pady=4)
-    Spinbox(frame, from_=1, to=MAX_THREADS, textvariable=core_num, width=18).grid(row=row, column=1)
-    row += 1
-    hw_opts = ['CPU']
-    if detect_intel_qsv(): hw_opts.append('Intel QSV')
-    if detect_amd_vaapi(): hw_opts.append('AMD VAAPI')
-    if gpus: hw_opts.append('NVIDIA CUDA')
-    Label(frame, text='加速方式:', width=20, anchor='e').grid(row=row, column=0, pady=4)
-    OptionMenu(frame, hw_var, *hw_opts).grid(row=row, column=1)
-    row += 1
-    Label(frame, text='选择 GPU 名称:', width=20, anchor='e').grid(row=row, column=0, pady=4)
-    gpu_menu = OptionMenu(frame, gpu_var, *gpus)
-    gpu_menu.grid(row=row, column=1)
-    if not gpus: gpu_menu.config(state='disabled')
-    row += 1
-    Label(frame, textvariable=max_label, fg='gray').grid(row=row, column=0, columnspan=2)
-    row += 1
-    Button(frame, text='开始提取帧', width=20, command=on_start).grid(row=row, column=0, columnspan=2, pady=10)
-    row += 1
-    status = Label(frame, text='', fg='blue')
-    status.grid(row=row, column=0, columnspan=2)
+        for idx in range(start, min(end, len(indices))):
+            success, frame = cap.read()
+            if not success:
+                break
+            transformed = transform(frame)
+            img_name = f"{indices[idx]:07d}.png" if format_type.endswith("png") else f"{indices[idx]:07d}.jpg"
+            img_path = os.path.join(folder, img_name)
+            cv2.imwrite(img_path, transformed)
+            results.append(idx)
+        cap.release()
+        return results
+
+    def split_video_to_images():
+        nonlocal split_mode
+        if not split_mode:
+            messagebox.showwarning("提示", "请先点击【确定】按钮加载视频信息。")
+            return
+
+        try:
+            count = int(split_entry.get())
+            if count <= 0:
+                raise ValueError
+        except:
+            messagebox.showerror("错误", "请输入有效的正整数作为分割数量。")
+            return
+
+        if total_frames[0] < count:
+            messagebox.showerror("错误", "分割数量不能大于视频总帧数。")
+            return
+
+        cores = int(cpu_combo.get())
+
+        format_type = format_var.get()
+        shuffle_flag = shuffle_var.get()
+
+        cap = cv2.VideoCapture(merged_video_path)
+        interval = total_frames[0] // count
+        indices = list(range(count))
+        if shuffle_flag:
+            np.random.shuffle(indices)
+
+        frame_indices = []
+        frame_idx = 0
+        saved_idx = 0
+        while saved_idx < count and cap.grab():
+            if frame_idx % interval == 0:
+                frame_indices.append(frame_idx)
+                saved_idx += 1
+            frame_idx += 1
+        cap.release()
+
+        frame_ranges = distribute_frames_evenly(len(frame_indices), cores)
+        tasks = []
+
+        for start, end in frame_ranges:
+            tasks.append((
+                start,
+                end,
+                merged_video_path,
+                format_type,
+                output_path[0],  # 使用用户选择的输出路径
+                indices[start:end]
+            ))
+
+        with ThreadPoolExecutor(max_workers=cores) as executor:
+            futures = []
+            for task in tasks:
+                future = executor.submit(process_frame_range, task)
+                futures.append(future)
+
+            for future in futures:
+                future.result()
+
+        messagebox.showinfo("完成", f"已保存 {count} 张图片到 {os.path.abspath(output_path[0])} 文件夹。")
+
+    def distribute_frames_evenly(length, num_workers):
+        avg = length // num_workers
+        remainder = length % num_workers
+        ranges = []
+        start = 0
+        for i in range(num_workers):
+            end = start + avg + (1 if i < remainder else 0)
+            ranges.append((start, end))
+            start = end
+        return ranges
+
+    main_frame = ttk.Frame(root, padding=20)
+    main_frame.pack(fill=tk.BOTH, expand=True)
+
+    # 视频操作区
+    video_frame = ttk.LabelFrame(main_frame, text="视频操作", padding=10)
+    video_frame.pack(fill=tk.X, pady=10)
+
+    ttk.Button(video_frame, text="选择视频文件", width=20, command=select_videos).pack(side=tk.LEFT, padx=5)
+    ttk.Button(video_frame, text="选择输出路径", width=20, command=select_output_folder).pack(side=tk.LEFT, padx=5)
+    ttk.Button(video_frame, text="确定", width=10, command=analyze_and_concatenate).pack(side=tk.LEFT, padx=5)
+
+    output_label = ttk.Label(main_frame, text="输出路径：未选择", anchor="w")
+    output_label.pack(fill=tk.X, pady=5)
+
+    # 参数设置区
+    param_frame = ttk.LabelFrame(main_frame, text="参数设置", padding=10)
+    param_frame.pack(fill=tk.X, pady=10)
+
+    grid_frame = ttk.Frame(param_frame)
+    grid_frame.pack()
+
+    ttk.Label(grid_frame, text="最大可裁切数量：").grid(row=0, column=0, sticky=tk.W, pady=5)
+    frame_count_label = ttk.Label(grid_frame, text="0")
+    frame_count_label.grid(row=0, column=1, sticky=tk.W, padx=10)
+
+    ttk.Label(grid_frame, text="目标图片数量：").grid(row=1, column=0, sticky=tk.W, pady=5)
+    split_entry = ttk.Entry(grid_frame, width=10)
+    split_entry.grid(row=1, column=1, sticky=tk.W, padx=10)
+
+    ttk.Label(grid_frame, text="输出格式：").grid(row=2, column=0, sticky=tk.W, pady=5)
+    format_var = tk.StringVar(value="png")
+    format_menu = ttk.OptionMenu(grid_frame, format_var, "png", "png", "hsv", "gray", "gray_png", "gray_hsv")
+    format_menu.grid(row=2, column=1, sticky=tk.W, padx=10)
+
+    ttk.Label(grid_frame, text="CPU 核心数：").grid(row=3, column=0, sticky=tk.W, pady=5)
+    cpu_values = [str(i) for i in range(1, os.cpu_count() + 1)]
+    cpu_combo = ttk.Combobox(grid_frame, values=cpu_values, width=8)
+    cpu_combo.current(len(cpu_values) - 1)  # 默认选最后一个（最大核心数）
+    cpu_combo.grid(row=3, column=1, sticky=tk.W, padx=10)
+
+    shuffle_var = tk.BooleanVar()
+    ttk.Checkbutton(grid_frame, text="打乱图片顺序", variable=shuffle_var).grid(row=4, column=0, sticky=tk.W, pady=5)
+
+    # 开始按钮
+    ttk.Button(main_frame, text="开始", width=20, command=split_video_to_images).pack(pady=15)
+
+    # 列表框
+    listbox = tk.Listbox(main_frame, height=8)
+    listbox.pack(fill=tk.BOTH, expand=True, pady=10)
 
     root.mainloop()
 
-if __name__ == '__main__':
-    main()
+
+if __name__ == "__main__":
+    create_video_importer_gui()
+
+
+
