@@ -61,20 +61,33 @@ def create_video_importer_gui():
             messagebox.showwarning("提示", "请至少选择两个视频进行拼接。")
             return
 
-        cap1 = cv2.VideoCapture(video_files[0])
-        w1 = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h1 = int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps1 = cap1.get(cv2.CAP_PROP_FPS)
-        ext1 = os.path.splitext(video_files[0])[1].lower()
-        cap1.release()
+        # 获取第一个视频文件的信息
+        probe_info = ffmpeg.probe(video_files[0])
+        streams = probe_info['streams']
+        # Check for audio stream presence (not used in the current logic)
+        any(stream['codec_type'] == 'audio' for stream in streams)
+        video_stream1 = next((stream for stream in streams if stream['codec_type'] == 'video'), None)
+        if not video_stream1:
+            messagebox.showerror("错误", "第一个视频文件没有视频流。")
+            return
+
+        w1 = int(video_stream1['width'])
+        h1 = int(video_stream1['height'])
+        fps1 = float(video_stream1['avg_frame_rate'].split('/')[0]) / float(video_stream1['avg_frame_rate'].split('/')[1])
 
         for path in video_files[1:]:
-            cap = cv2.VideoCapture(path)
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            ext = os.path.splitext(path)[1].lower()
-            cap.release()
+            probe_info = ffmpeg.probe(path)
+            streams = probe_info['streams']  # Update streams for the current video file
+            # Check for audio stream presence (not used in the current logic)
+            any(stream['codec_type'] == 'audio' for stream in streams)
+            video_stream = next((stream for stream in streams if stream['codec_type'] == 'video'), None)
+            if not video_stream:
+                messagebox.showerror("错误", f"视频文件 {os.path.basename(path)} 没有视频流。")
+                return
+
+            w = int(video_stream['width'])
+            h = int(video_stream['height'])
+            fps = float(video_stream['avg_frame_rate'].split('/')[0]) / float(video_stream['avg_frame_rate'].split('/')[1])
 
             if w != w1 or h != h1:
                 messagebox.showerror("错误", "分辨率不同，请选择相同分辨率的视频。")
@@ -84,20 +97,39 @@ def create_video_importer_gui():
                 messagebox.showerror("错误", "帧率不同，请选择相同帧率的视频。")
                 return
 
-            if ext != ext1:
-                messagebox.showerror("错误", "格式不同，请选择相同格式的视频。")
-                return
-
         if not output_path[0]:
             messagebox.showwarning("提示", "请先选择输出文件夹。")
             return
 
         inputs = [ffmpeg.input(file) for file in video_files]
-        joined = ffmpeg.concat(*inputs, v=1, a=1).node
-        output = ffmpeg.output(joined[0], joined[1], merged_video_path)
+
+        # 检查每个输入是否有音频流
+        audio_flags = []
+        for file in video_files:
+            probe_info = ffmpeg.probe(file)
+            streams = probe_info['streams']
+            has_audio = any(stream['codec_type'] == 'audio' for stream in streams)
+            audio_flags.append(has_audio)
+
+        if all(audio_flags):
+            # 所有视频都有音频流
+            concat_inputs = []
+            for inp in inputs:
+                concat_inputs.append(inp.video)
+                concat_inputs.append(inp.audio)
+            joined = ffmpeg.concat(*concat_inputs, v=1, a=1).node
+            output = ffmpeg.output(joined[0], joined[1], merged_video_path).overwrite_output()
+        elif not any(audio_flags):
+            # 所有视频都没有音频流
+            video_streams = [inp.video for inp in inputs]
+            joined = ffmpeg.concat(*video_streams, v=1, a=0).node
+            output = ffmpeg.output(joined[0], merged_video_path).overwrite_output()
+        else:
+            messagebox.showerror("错误", "部分视频文件缺少音频流，无法合并音频。")
+            return
 
         try:
-            ffmpeg.run(output, overwrite_output=True)  # 添加 overwrite_output=True 参数
+            ffmpeg.run(output)
             messagebox.showinfo("成功", f"视频已保存到：\n{merged_video_path}")
             
             cap = cv2.VideoCapture(merged_video_path)
@@ -126,20 +158,21 @@ def create_video_importer_gui():
         return transform
 
     def process_frame_range(args):
-        start, end, filename, format_type, folder, indices = args
+        _, _, filename, format_type, folder, indices = args
         cap = cv2.VideoCapture(filename)
         transform = get_frame_transform_func(format_type)
         results = []
 
-        for idx in range(start, min(end, len(indices))):
+        for frame_idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             success, frame = cap.read()
             if not success:
-                break
+                continue
             transformed = transform(frame)
-            img_name = f"{indices[idx]:07d}.png" if format_type.endswith("png") else f"{indices[idx]:07d}.jpg"
+            img_name = f"{frame_idx:07d}.png" if format_type.endswith("png") else f"{frame_idx:07d}.jpg"
             img_path = os.path.join(folder, img_name)
             cv2.imwrite(img_path, transformed)
-            results.append(idx)
+            results.append(frame_idx)
         cap.release()
         return results
 
@@ -165,24 +198,13 @@ def create_video_importer_gui():
 
         format_type = format_var.get()
         shuffle_flag = shuffle_var.get()
-
-        cap = cv2.VideoCapture(merged_video_path)
-        interval = total_frames[0] // count
-        indices = list(range(count))
+        # 生成均匀分布的帧索引，确保数量精确
+        indices = np.linspace(0, total_frames[0] - 1, count, dtype=int)
+        indices = indices.tolist()
         if shuffle_flag:
             np.random.shuffle(indices)
 
-        frame_indices = []
-        frame_idx = 0
-        saved_idx = 0
-        while saved_idx < count and cap.grab():
-            if frame_idx % interval == 0:
-                frame_indices.append(frame_idx)
-                saved_idx += 1
-            frame_idx += 1
-        cap.release()
-
-        frame_ranges = distribute_frames_evenly(len(frame_indices), cores)
+        frame_ranges = distribute_frames_evenly(len(indices), cores)
         tasks = []
 
         for start, end in frame_ranges:
